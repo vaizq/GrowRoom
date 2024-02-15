@@ -14,31 +14,37 @@
 #include "MqttClient.h"
 #include "RpcError.h"
 #include <map>
+#include "imgui_stdlib.h"
+#include <fstream>
 
 
 const std::string SERVER_ADDRESS("test.mosquitto.org:1883");
 const std::string CLIENT_ID("reservoir-controller");
+const std::string configFile{"ReservoirController.json"};
 
 
 class ReservoirController : public App
 {
     using ResponseHandler = std::function<void(const nlohmann::json& response)>;
-    // Gui stuff
+    // Gui
     bool mValveIsOpen{false};
+    int mUseID{true};
     int mPumpID{};
     float mDoseAmount{};
     float mCalibrationPH{7.0f};
     float mCalibrationEC{0.0f};
+    int mDosersCount{-1};
+    std::map<int, std::string> mDoserNutrients;
+    // Telemetry
     std::deque<float> mPHReadings{};
     std::deque<float> mECReadings{};
-    std::string mLiquidLevel{"empty"};
-    std::deque<mqtt::const_message_ptr> mMessage;
     static constexpr std::size_t readingsMax{100};
-    RpcError mRpcError{};
-    int mDosersCount{-1};
-    std::map<int, ResponseHandler> mResponseHandlers;
+    std::string mLiquidLevel{"empty"};
+    // Messaging
     MqttClient mClient;
-
+    std::deque<mqtt::const_message_ptr> mMessages;
+    std::map<int, ResponseHandler> mResponseHandlers;
+    RpcError mRpcError{};
 
     void openValve() {
         mClient.publish(requestTopic,
@@ -131,7 +137,7 @@ class ReservoirController : public App
         mResponseHandlers[id] = std::move(handler);
     }
 
-    void handleStatusUpdate(const nlohmann::json& msg) {
+    void handleTelemetry(const nlohmann::json& msg) {
         if (msg.contains("ph")) {
             mPHReadings.push_back(msg["ph"]);
             if (mPHReadings.size() > readingsMax) {
@@ -164,18 +170,18 @@ class ReservoirController : public App
 
     void handleMessages()
     {
-        while (!mMessage.empty())
+        while (!mMessages.empty())
         {
-            auto msg = mMessage.front();
+            auto msg = mMessages.front();
 
             if (msg->get_topic() == telemetryTopic) {
-                handleStatusUpdate(nlohmann::json::parse(msg->get_payload()));
+                handleTelemetry(nlohmann::json::parse(msg->get_payload()));
             }
             else if (msg->get_topic() == responseTopic) {
                 handleResponse(nlohmann::json::parse(msg->get_payload()));
             }
 
-            mMessage.pop_front();
+            mMessages.pop_front();
         }
     }
 
@@ -184,15 +190,74 @@ public:
     : mClient(SERVER_ADDRESS, CLIENT_ID)
     {
         mClient.onMessage([this](mqtt::const_message_ptr msg) {
-            mMessage.push_back(msg);
+            mMessages.push_back(msg);
         });
 
         mClient.connect();
+
+        try {
+            std::ifstream ifs(configFile);
+            nlohmann::json cfg;
+            ifs >> cfg;
+            if (cfg.contains("doserNutrients")) {
+                mDoserNutrients = cfg["doserNutrients"];
+            }
+        }
+        catch(const std::exception& e) {
+            std::cerr << "Unable to load config" << std::endl;
+        }
     }
 
-    void onGUI(Clock::duration dt)
+    ~ReservoirController() override
     {
-        ImGui::Begin("ReservoirController");
+        std::ofstream ofs(configFile, std::ios::out);
+        try {
+            nlohmann::json cfg{
+                    {"doserNutrients", mDoserNutrients}
+            };
+            ofs << cfg;
+        }
+        catch (const std::exception& e) {
+            std::cerr << "Unable to store config" << std::endl;
+        }
+    }
+
+    void onGUI()
+    {
+        ImGui::Begin("ReservoirController", NULL, ImGuiWindowFlags_MenuBar);
+
+        if (ImGui::BeginMenuBar()) {
+            if (ImGui::BeginMenu("Menu")) {
+                if (ImGui::BeginMenu("Options")) {
+                    if (ImGui::Button(mUseID ? "Use nutrient" : "Use doserID")) {
+                        mUseID = !mUseID;
+                    }
+                    ImGui::EndMenu();
+                }
+                if (ImGui::BeginMenu("Configure dosers")) {
+                    if (mDosersCount != -1) {
+                        static int pumpID{};
+                        static std::string nutrient;
+
+                        ImGui::InputInt("pumpID", &pumpID);
+                        ImGui::InputText("nutrient", &nutrient);
+                        if (ImGui::Button("store")) {
+                            mDoserNutrients[pumpID] = nutrient;
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("close")) {
+                            ImGui::CloseCurrentPopup();
+                        }
+                    }
+                    else {
+                        getDosersCount();
+                    }
+                    ImGui::EndMenu();
+                }
+                ImGui::EndMenu();
+            }
+            ImGui::EndMenuBar();
+        }
 
         if (mClient.isConnected()) {
 
@@ -226,8 +291,18 @@ public:
 
             // Dosing
             ImGui::SetNextItemWidth(100);
-            ImGui::InputInt("pumpID", &mPumpID);
-            ImGui::SameLine();
+            if (mUseID) {
+                ImGui::InputInt("pumpID", &mPumpID);
+                ImGui::SameLine();
+            }
+            else {
+                for (const auto& [id, nutrient] : mDoserNutrients) {
+                    if (ImGui::Selectable(nutrient.c_str(), id == mPumpID)) {
+                        mPumpID = id;
+                    }
+                }
+            }
+
             ImGui::SliderFloat("amount", &mDoseAmount, 0.0f, 100.0f);
             ImGui::SameLine();
             if (ImGui::Button("dose")) {
@@ -239,7 +314,7 @@ public:
             }
 
             // PH calibration
-            ImGui::SliderFloat("ph", &mCalibrationPH, 0.0f, 14.0f);
+            ImGui::SliderFloat("PH", &mCalibrationPH, 0.0f, 14.0f);
             ImGui::SameLine();
             if (ImGui::Button("calibrate ph-sensor")) {
                 ImGui::OpenPopup("Calibrate PH");
@@ -260,9 +335,9 @@ public:
             }
 
             // EC calibration
-            ImGui::SliderFloat("ec", &mCalibrationEC, 0.0f, 3.0f);
+            ImGui::SliderFloat("EC", &mCalibrationEC, 0.0f, 3.0f);
             ImGui::SameLine();
-            if (ImGui::Button("calibrate ec-sensor")) {
+            if (ImGui::Button("calibrate EC-sensor")) {
                 ImGui::OpenPopup("Calibrate EC");
             }
 
@@ -287,9 +362,9 @@ public:
                 getDosersCount();
             }
 
-            // Error display
+            // Display error
             if (mRpcError.isAcute()) {
-                ImGui::Text("Error { code: %d, message: %s }", mRpcError.code(), mRpcError.message().c_str());
+                ImGui::Text("Error[%d]: %s }", mRpcError.code(), mRpcError.message().c_str());
             }
         }
         else {
@@ -301,10 +376,10 @@ public:
         ImGui::ShowDemoWindow();
     }
 
-    void update(Clock::duration dt) override
+    void update(Clock::duration /*dt*/) override
     {
         handleMessages();
-        onGUI(dt);
+        onGUI();
     }
 };
 
