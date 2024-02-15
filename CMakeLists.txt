@@ -12,6 +12,7 @@ find_package(PahoMqttCpp CONFIG REQUIRED)
 
 add_executable(GrowStudio main.cpp
         App.cpp
+        MqttClient.h
 )
 
 target_link_libraries(GrowStudio PRIVATE sfml-graphics ImGui-SFML::ImGui-SFML fmt::fmt)

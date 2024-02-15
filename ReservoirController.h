@@ -10,11 +10,16 @@
 #include <deque>
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
+#include <functional>
 #include <mqtt/async_client.h>
+#include "RpcError.h"
+#include <map>
 
 const std::string SERVER_ADDRESS("test.mosquitto.org:1883");
 const std::string CLIENT_ID("reservoir-controller");
-const std::string TOPIC("ReservoirController/#");
+const std::string telemetryTopic("ReservoirController/telemetry");
+const std::string responseTopic("ReservoirController/rpc/response");
+const std::string requestTopic("ReservoirController/rpc/request");
 
 const int	QOS = 1;
 const int	N_RETRY_ATTEMPTS = 5;
@@ -64,6 +69,12 @@ class callback : public virtual mqtt::callback,
                  public virtual mqtt::iaction_listener
 
 {
+public:
+    using MessageHandler = std::function<void(mqtt::const_message_ptr)>;
+    using ConnectedHandler = std::function<void()>;
+    using ConnectionLostHandler = std::function<void()>;
+
+private:
     // Counter for the number of connection retries
     int nretry_;
     // The MQTT client
@@ -72,6 +83,9 @@ class callback : public virtual mqtt::callback,
     mqtt::connect_options& connOpts_;
     // An action listener to display the result of actions.
     action_listener subListener_;
+    MessageHandler mMessageHandler{[](auto){}};
+    ConnectedHandler mConnectedHandler{[](){}};
+    ConnectionLostHandler mConnectionLostHandler{[](){}};
 
     // This deomonstrates manually reconnecting to the broker by calling
     // connect() again. This is a possibility for an application that keeps
@@ -104,18 +118,16 @@ class callback : public virtual mqtt::callback,
 
     // (Re)connection success
     void connected(const std::string& cause) override {
-        std::cout << "\nConnection success" << std::endl;
-        std::cout << "\nSubscribing to topic '" << TOPIC << "'\n"
-                  << "\tfor client " << CLIENT_ID
-                  << " using QoS" << QOS << "\n"
-                  << "\nPress Q<Enter> to quit\n" << std::endl;
-
-        cli_.subscribe(TOPIC, QOS, nullptr, subListener_);
+        mConnectedHandler();
+        cli_.subscribe(telemetryTopic, QOS, nullptr, subListener_);
+        cli_.subscribe(responseTopic, QOS, nullptr, subListener_);
     }
 
     // Callback for when the connection is lost.
     // This will initiate the attempt to manually reconnect.
     void connection_lost(const std::string& cause) override {
+        mConnectionLostHandler();
+
         std::cout << "\nConnection lost" << std::endl;
         if (!cause.empty())
             std::cout << "\tcause: " << cause << std::endl;
@@ -127,9 +139,7 @@ class callback : public virtual mqtt::callback,
 
     // Callback for when a message arrives.
     void message_arrived(mqtt::const_message_ptr msg) override {
-        std::cout << "Message arrived" << std::endl;
-        std::cout << "\ttopic: '" << msg->get_topic() << "'" << std::endl;
-        std::cout << "\tpayload: '" << msg->to_string() << "'\n" << std::endl;
+        mMessageHandler(msg);
     }
 
     void delivery_complete(mqtt::delivery_token_ptr token) override {}
@@ -137,57 +147,187 @@ class callback : public virtual mqtt::callback,
 public:
     callback(mqtt::async_client& cli, mqtt::connect_options& connOpts)
             : nretry_(0), cli_(cli), connOpts_(connOpts), subListener_("Subscription") {}
+
+    void onMessage(MessageHandler h) {
+        mMessageHandler = std::move(h);
+    }
+
+    void onConnected(ConnectedHandler h) {
+        mConnectedHandler = std::move(h);
+    }
+
+    void onConnectionLost(ConnectionLostHandler h) {
+        mConnectionLostHandler = std::move(h);
+    }
 };
 
 class ReservoirController : public App
 {
+    using ResponseHandler = std::function<void(const nlohmann::json& response)>;
     // Gui stuff
     bool mValveIsOpen{false};
     int mPumpID{};
     float mDoseAmount{};
     float mPH{7.0f};
     float mEC{0.0f};
-    std::deque<float> mPHReadings{7.0f, 6.8f, 6.5f, 6.4f, 6.3f, 6.2f};
-    std::deque<float> mECReadings{2.0f, 1.8f, 1.5f, 1.4f, 1.3f, 1.2f};
+    std::deque<float> mPHReadings{};
+    std::deque<float> mECReadings{};
     std::string mLiquidLevel{"empty"};
     mqtt::connect_options mConnOpts;
     mqtt::async_client mClient;
     callback mCb;
+    std::deque<mqtt::const_message_ptr> mMessage;
+    bool mConnected{false};
+    static constexpr std::size_t maxReadings{100};
+    RpcError mRpcError{};
+    int mDosersCount{-1};
+    std::map<int, ResponseHandler> mResponseHandlers;
+
 
 
     void openValve() {
-        std::cout << "openValve()" << std::endl;
+        mClient.publish(requestTopic,
+                        nlohmann::json{
+                                {"jsonrpc", "2.0"},
+                                {"id", 0},
+                                {"method", "openValve"}
+        }.dump());
     }
 
     void closeValve() {
-        std::cout << "closeValve()" << std::endl;
+        mClient.publish(requestTopic,
+                        nlohmann::json{
+                                {"jsonrpc", "2.0"},
+                                {"id", 0},
+                                {"method", "closeValve"}
+                        }.dump());
     }
 
-    void dose(unsigned pumpID, float amount) {
-        std::cout << "dose(" << pumpID << ", " << amount << ')' << std::endl;
+    void dose(unsigned doserID, float amount) {
+        mClient.publish(requestTopic,
+                        nlohmann::json{
+                                {"jsonrpc", "2.0"},
+                                {"id", 0},
+                                {"method", "dose"},
+                                {"params",
+                                     nlohmann::json{
+                                            {"doserID", doserID},
+                                            {"amount",  amount}
+                                    }
+                                }
+                        }.dump());
     }
 
     void resetDosers() {
-        std::cout << "resetDosers()" << std::endl;
+        mClient.publish(requestTopic,
+                        nlohmann::json{
+                                {"jsonrpc", "2.0"},
+                                {"id", 0},
+                                {"method", "resetDosers"}
+                        }.dump());
     }
 
-    void calibratePHSensor(float phValue) {
-        std::cout << "calibratePHSensor(" << phValue << ')' << std::endl;
+    void calibratePHSensor(float ph) {
+        mClient.publish(requestTopic,
+                        nlohmann::json{
+                                {"jsonrpc", "2.0"},
+                                {"id", 0},
+                                {"method", "calibratePHSensor"},
+                                {"params",
+                                    nlohmann::json{
+                                        {"phValue", ph}
+                                    }
+                                }
+                        }.dump());
     }
 
-    void calibrateECSensor(float phValue) {
-        std::cout << "calibrateECSensor(" << phValue << ')' << std::endl;
+    void calibrateECSensor(float ec) {
+        mClient.publish(requestTopic,
+                        nlohmann::json{
+                                {"jsonrpc", "2.0"},
+                                {"id", 0},
+                                {"method", "calibrateECSensor"},
+                                {"params",
+                                 nlohmann::json{
+                                         {"ecValue", ec}
+                                 }
+                                }
+                        }.dump());
+    }
+
+    void getDosersCount() {
+        int id = 420;
+        mClient.publish(requestTopic,
+                        nlohmann::json{
+                                {"jsonrpc", "2.0"},
+                                {"id", id},
+                                {"method", "dosersCount"},
+                        }.dump());
+
+        onResponse(id, [this](const nlohmann::json& response) {
+            if (response.contains("result")) {
+                mDosersCount = response["result"];
+            }
+        });
+    }
+
+    void onResponse(int id, ResponseHandler handler)
+    {
+        mResponseHandlers[id] = std::move(handler);
     }
 
     void handleStatusUpdate(const nlohmann::json& msg) {
         if (msg.contains("ph")) {
             mPHReadings.push_back(msg["ph"]);
+            if (mPHReadings.size() > maxReadings) {
+                mPHReadings.pop_front();
+            }
         }
         if (msg.contains("ec")) {
             mECReadings.push_back(msg["ec"]);
+            if (mECReadings.size() > maxReadings) {
+                mECReadings.pop_front();
+            }
         }
         if (msg.contains("liquidLevel")) {
             mLiquidLevel = msg["liquidLevel"];
+        }
+    }
+
+    void handleResponse(const nlohmann::json& response) {
+        if (!response.contains("id")) {
+            std::cerr << "Response does not contain id" << std::endl;
+            return;
+        }
+
+        try {
+            if (mResponseHandlers.contains(response["id"])) {
+                mResponseHandlers[response["id"]](response);
+            }
+            if (response.contains("error")) {
+                std::cout << "Error!" << std::endl;
+                mRpcError = RpcError{response["error"].value("code", -1), response["error"].value("message", "No message")};
+            }
+        }
+        catch(const std::exception& e) {
+            std::cerr << "unable to handle response" << std::endl;
+        }
+    }
+
+    void handleMessages()
+    {
+        while (!mMessage.empty())
+        {
+            auto msg = mMessage.front();
+
+            if (msg->get_topic() == telemetryTopic) {
+                handleStatusUpdate(nlohmann::json::parse(msg->get_payload()));
+            }
+            else if (msg->get_topic() == responseTopic) {
+                handleResponse(nlohmann::json::parse(msg->get_payload()));
+            }
+
+            mMessage.pop_front();
         }
     }
 
@@ -195,6 +335,19 @@ public:
     ReservoirController()
     : mClient(SERVER_ADDRESS, CLIENT_ID), mCb(mClient, mConnOpts)
     {
+        mCb.onMessage([this](mqtt::const_message_ptr msg) {
+            mMessage.push_back(msg);
+        });
+
+        mCb.onConnected([this]() {
+            mConnected = true;
+        });
+
+        mCb.onConnectionLost([this]() {
+            mConnected = false;
+        });
+
+
         mConnOpts.set_clean_session(false);
         mClient.set_callback(mCb);
 
@@ -208,53 +361,105 @@ public:
     {
         ImGui::Begin("ReservoirController");
 
-        ImGui::SeparatorText("Status");
+        if (mConnected) {
 
-        // Status
-        ImGui::PlotLines("PH", &mPHReadings.front(), (int)mPHReadings.size());
-        ImGui::PlotLines("EC", &mECReadings.front(), (int)mECReadings.size());
-        ImGui::Text("LiquidLevel: %s", mLiquidLevel.c_str());
-        ImGui::NewLine();
-        ImGui::SeparatorText("RPC interface");
+            ImGui::SeparatorText("Status");
 
-        // Valve ON/OFF
-        if (ImGui::Button(mValveIsOpen ? "Close valve" : "Open valve")) {
-            if (mValveIsOpen) {
-                closeValve();
+            // Status
+            ImGui::PlotLines("PH", &mPHReadings.front(), (int) mPHReadings.size());
+            ImGui::SameLine();
+            if (!mPHReadings.empty())
+                ImGui::Value(": ", mPHReadings.back());
+            ImGui::PlotLines("EC", &mECReadings.front(), (int) mECReadings.size());
+            ImGui::SameLine();
+            if (!mECReadings.empty())
+                ImGui::Value(":", mECReadings.back());
+            ImGui::Text("LiquidLevel: %s", mLiquidLevel.c_str());
+            ImGui::NewLine();
+            ImGui::SeparatorText("RPC interface");
+
+            // Valve ON/OFF
+            if (ImGui::Button(mValveIsOpen ? "Close valve" : "Open valve")) {
+                if (mValveIsOpen) {
+                    closeValve();
+                } else {
+                    openValve();
+                }
+
+                mValveIsOpen = !mValveIsOpen;
             }
-            else {
-                openValve();
+
+            // Dosing
+            ImGui::SetNextItemWidth(100);
+            ImGui::InputInt("pumpID", &mPumpID);
+            ImGui::SameLine();
+            ImGui::SliderFloat("amount", &mDoseAmount, 0.0f, 100.0f);
+            ImGui::SameLine();
+            if (ImGui::Button("dose")) {
+                dose(static_cast<unsigned>(mPumpID), mDoseAmount);
             }
 
-            mValveIsOpen = !mValveIsOpen;
-        }
+            if (ImGui::Button("reset dosers")) {
+                resetDosers();
+            }
 
-        // Dosing
-        ImGui::SetNextItemWidth(100);
-        ImGui::InputInt("pumpID", &mPumpID);
-        ImGui::SameLine();
-        ImGui::SliderFloat("amount", &mDoseAmount, 0.0f, 100.0f);
-        ImGui::SameLine();
-        if (ImGui::Button("dose")) {
-            dose(static_cast<unsigned>(mPumpID), mDoseAmount);
-        }
+            // PH calibration
+            ImGui::SliderFloat("ph", &mPH, 0.0f, 14.0f);
+            ImGui::SameLine();
+            if (ImGui::Button("calibrate ph-sensor")) {
+                ImGui::OpenPopup("Calibrate PH");
+            }
 
-        if (ImGui::Button("reset dosers")) {
-            resetDosers();
-        }
+            if (ImGui::BeginPopupModal("Calibrate PH")) {
+                ImGui::Text("Is your PH probe in %.2f calibration solution?", mPH);
+                if (ImGui::Button("Yes")) {
+                    ImGui::CloseCurrentPopup();
+                    calibratePHSensor(mPH);
+                }
+                ImGui::SetItemDefaultFocus();
+                ImGui::SameLine();
+                if (ImGui::Button("No")) {
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
 
-        // PH calibration
-        ImGui::SliderFloat("ph", &mPH, 0.0f, 14.0f);
-        ImGui::SameLine();
-        if(ImGui::Button("calibrate ph-sensor")) {
-            calibratePHSensor(mPH);
-        }
+            // EC calibration
+            ImGui::SliderFloat("ec", &mEC, 0.0f, 3.0f);
+            ImGui::SameLine();
+            if (ImGui::Button("calibrate ec-sensor")) {
+                ImGui::OpenPopup("Calibrate EC");
+            }
 
-        // EC calibration
-        ImGui::SliderFloat("ec", &mEC, 0.0f, 3.0f);
-        ImGui::SameLine();
-        if(ImGui::Button("calibrate ec-sensor")) {
-            calibrateECSensor(mEC);
+            if (ImGui::BeginPopupModal("Calibrate EC")) {
+                ImGui::Text("Is your EC probe in %.2f calibration solution?", mEC);
+                if (ImGui::Button("Yes")) {
+                    ImGui::CloseCurrentPopup();
+                    calibrateECSensor(mEC);
+                }
+                ImGui::SetItemDefaultFocus();
+                ImGui::SameLine();
+                if (ImGui::Button("No")) {
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+
+            // Show dosers count
+            ImGui::Text("Dosers count: %s", (mDosersCount == -1) ? "unknown" : std::to_string(mDosersCount).c_str());
+            ImGui::SameLine();
+            if (ImGui::Button("get dosers count")) {
+                getDosersCount();
+            }
+
+            // Error display
+            if (mRpcError.isAcute()) {
+                ImGui::Text("Error { code: %d, message: %s }", mRpcError.code(), mRpcError.message().c_str());
+            }
+
+        }
+        else {
+            ImGui::Text("Not Connected");
         }
 
         ImGui::End();
@@ -264,8 +469,11 @@ public:
 
     void update(Clock::duration dt) override
     {
+        handleMessages();
         onGUI(dt);
     }
+
+
 };
 
 
