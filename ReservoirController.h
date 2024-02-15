@@ -11,155 +11,14 @@
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 #include <functional>
-#include <mqtt/async_client.h>
+#include "MqttClient.h"
 #include "RpcError.h"
 #include <map>
 
+
 const std::string SERVER_ADDRESS("test.mosquitto.org:1883");
 const std::string CLIENT_ID("reservoir-controller");
-const std::string telemetryTopic("ReservoirController/telemetry");
-const std::string responseTopic("ReservoirController/rpc/response");
-const std::string requestTopic("ReservoirController/rpc/request");
 
-const int	QOS = 1;
-const int	N_RETRY_ATTEMPTS = 5;
-
-class ReservoirController;
-
-/////////////////////////////////////////////////////////////////////////////
-
-// Callbacks for the success or failures of requested actions.
-// This could be used to initiate further action, but here we just log the
-// results to the console.
-
-class action_listener : public virtual mqtt::iaction_listener
-{
-    std::string name_;
-
-    void on_failure(const mqtt::token& tok) override {
-        std::cout << name_ << " failure";
-        if (tok.get_message_id() != 0)
-            std::cout << " for token: [" << tok.get_message_id() << "]" << std::endl;
-        std::cout << std::endl;
-    }
-
-    void on_success(const mqtt::token& tok) override {
-        std::cout << name_ << " success";
-        if (tok.get_message_id() != 0)
-            std::cout << " for token: [" << tok.get_message_id() << "]" << std::endl;
-        auto top = tok.get_topics();
-        if (top && !top->empty())
-            std::cout << "\ttoken topic: '" << (*top)[0] << "', ..." << std::endl;
-        std::cout << std::endl;
-    }
-
-public:
-    action_listener(const std::string& name) : name_(name) {}
-};
-
-/////////////////////////////////////////////////////////////////////////////
-
-/**
- * Local callback & listener class for use with the client connection.
- * This is primarily intended to receive messages, but it will also monitor
- * the connection to the broker. If the connection is lost, it will attempt
- * to restore the connection and re-subscribe to the topic.
- */
-class callback : public virtual mqtt::callback,
-                 public virtual mqtt::iaction_listener
-
-{
-public:
-    using MessageHandler = std::function<void(mqtt::const_message_ptr)>;
-    using ConnectedHandler = std::function<void()>;
-    using ConnectionLostHandler = std::function<void()>;
-
-private:
-    // Counter for the number of connection retries
-    int nretry_;
-    // The MQTT client
-    mqtt::async_client& cli_;
-    // Options to use if we need to reconnect
-    mqtt::connect_options& connOpts_;
-    // An action listener to display the result of actions.
-    action_listener subListener_;
-    MessageHandler mMessageHandler{[](auto){}};
-    ConnectedHandler mConnectedHandler{[](){}};
-    ConnectionLostHandler mConnectionLostHandler{[](){}};
-
-    // This deomonstrates manually reconnecting to the broker by calling
-    // connect() again. This is a possibility for an application that keeps
-    // a copy of it's original connect_options, or if the app wants to
-    // reconnect with different options.
-    // Another way this can be done manually, if using the same options, is
-    // to just call the async_client::reconnect() method.
-    void reconnect() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
-        try {
-            cli_.connect(connOpts_, nullptr, *this);
-        }
-        catch (const mqtt::exception& exc) {
-            std::cerr << "Error: " << exc.what() << std::endl;
-            exit(1);
-        }
-    }
-
-    // Re-connection failure
-    void on_failure(const mqtt::token& tok) override {
-        std::cout << "Connection attempt failed" << std::endl;
-        if (++nretry_ > N_RETRY_ATTEMPTS)
-            exit(1);
-        reconnect();
-    }
-
-    // (Re)connection success
-    // Either this or connected() can be used for callbacks.
-    void on_success(const mqtt::token& tok) override {}
-
-    // (Re)connection success
-    void connected(const std::string& cause) override {
-        mConnectedHandler();
-        cli_.subscribe(telemetryTopic, QOS, nullptr, subListener_);
-        cli_.subscribe(responseTopic, QOS, nullptr, subListener_);
-    }
-
-    // Callback for when the connection is lost.
-    // This will initiate the attempt to manually reconnect.
-    void connection_lost(const std::string& cause) override {
-        mConnectionLostHandler();
-
-        std::cout << "\nConnection lost" << std::endl;
-        if (!cause.empty())
-            std::cout << "\tcause: " << cause << std::endl;
-
-        std::cout << "Reconnecting..." << std::endl;
-        nretry_ = 0;
-        reconnect();
-    }
-
-    // Callback for when a message arrives.
-    void message_arrived(mqtt::const_message_ptr msg) override {
-        mMessageHandler(msg);
-    }
-
-    void delivery_complete(mqtt::delivery_token_ptr token) override {}
-
-public:
-    callback(mqtt::async_client& cli, mqtt::connect_options& connOpts)
-            : nretry_(0), cli_(cli), connOpts_(connOpts), subListener_("Subscription") {}
-
-    void onMessage(MessageHandler h) {
-        mMessageHandler = std::move(h);
-    }
-
-    void onConnected(ConnectedHandler h) {
-        mConnectedHandler = std::move(h);
-    }
-
-    void onConnectionLost(ConnectionLostHandler h) {
-        mConnectionLostHandler = std::move(h);
-    }
-};
 
 class ReservoirController : public App
 {
@@ -168,21 +27,17 @@ class ReservoirController : public App
     bool mValveIsOpen{false};
     int mPumpID{};
     float mDoseAmount{};
-    float mPH{7.0f};
-    float mEC{0.0f};
+    float mCalibrationPH{7.0f};
+    float mCalibrationEC{0.0f};
     std::deque<float> mPHReadings{};
     std::deque<float> mECReadings{};
     std::string mLiquidLevel{"empty"};
-    mqtt::connect_options mConnOpts;
-    mqtt::async_client mClient;
-    callback mCb;
     std::deque<mqtt::const_message_ptr> mMessage;
-    bool mConnected{false};
-    static constexpr std::size_t maxReadings{100};
+    static constexpr std::size_t readingsMax{100};
     RpcError mRpcError{};
     int mDosersCount{-1};
     std::map<int, ResponseHandler> mResponseHandlers;
-
+    MqttClient mClient;
 
 
     void openValve() {
@@ -279,15 +134,12 @@ class ReservoirController : public App
     void handleStatusUpdate(const nlohmann::json& msg) {
         if (msg.contains("ph")) {
             mPHReadings.push_back(msg["ph"]);
-            if (mPHReadings.size() > maxReadings) {
+            if (mPHReadings.size() > readingsMax) {
                 mPHReadings.pop_front();
             }
         }
         if (msg.contains("ec")) {
             mECReadings.push_back(msg["ec"]);
-            if (mECReadings.size() > maxReadings) {
-                mECReadings.pop_front();
-            }
         }
         if (msg.contains("liquidLevel")) {
             mLiquidLevel = msg["liquidLevel"];
@@ -300,17 +152,13 @@ class ReservoirController : public App
             return;
         }
 
-        try {
-            if (mResponseHandlers.contains(response["id"])) {
-                mResponseHandlers[response["id"]](response);
-            }
-            if (response.contains("error")) {
-                std::cout << "Error!" << std::endl;
-                mRpcError = RpcError{response["error"].value("code", -1), response["error"].value("message", "No message")};
-            }
+        if (mResponseHandlers.contains(response["id"])) {
+            mResponseHandlers[response["id"]](response);
         }
-        catch(const std::exception& e) {
-            std::cerr << "unable to handle response" << std::endl;
+
+        if (response.contains("error")) {
+            std::cout << "Error!" << std::endl;
+            mRpcError = RpcError{response["error"].value("code", -1), response["error"].value("message", "No message")};
         }
     }
 
@@ -333,47 +181,34 @@ class ReservoirController : public App
 
 public:
     ReservoirController()
-    : mClient(SERVER_ADDRESS, CLIENT_ID), mCb(mClient, mConnOpts)
+    : mClient(SERVER_ADDRESS, CLIENT_ID)
     {
-        mCb.onMessage([this](mqtt::const_message_ptr msg) {
+        mClient.onMessage([this](mqtt::const_message_ptr msg) {
             mMessage.push_back(msg);
         });
 
-        mCb.onConnected([this]() {
-            mConnected = true;
-        });
-
-        mCb.onConnectionLost([this]() {
-            mConnected = false;
-        });
-
-
-        mConnOpts.set_clean_session(false);
-        mClient.set_callback(mCb);
-
-        // Start the connection.
-        // When completed, the callback will subscribe to topic.
-        std::cout << "Connecting to the MQTT server..." << std::flush;
-        mClient.connect(mConnOpts, nullptr, mCb);
+        mClient.connect();
     }
 
     void onGUI(Clock::duration dt)
     {
         ImGui::Begin("ReservoirController");
 
-        if (mConnected) {
+        if (mClient.isConnected()) {
 
             ImGui::SeparatorText("Status");
 
             // Status
-            ImGui::PlotLines("PH", &mPHReadings.front(), (int) mPHReadings.size());
-            ImGui::SameLine();
-            if (!mPHReadings.empty())
-                ImGui::Value(": ", mPHReadings.back());
-            ImGui::PlotLines("EC", &mECReadings.front(), (int) mECReadings.size());
-            ImGui::SameLine();
-            if (!mECReadings.empty())
-                ImGui::Value(":", mECReadings.back());
+            if (!mPHReadings.empty()) {
+                std::vector<float> readings{mPHReadings.begin(), mPHReadings.end()};
+                ImGui::PlotLines(fmt::format("PH [{:.2f}]", mPHReadings.back()).c_str(), &readings.front(), static_cast<int>(readings.size()));
+            }
+
+            if (!mECReadings.empty()) {
+                std::vector<float> readings{mECReadings.begin(), mECReadings.end()};
+                ImGui::PlotLines(fmt::format("EC [{:.2f}]", mECReadings.back()).c_str(), &readings.front(), static_cast<int>(readings.size()));
+            }
+
             ImGui::Text("LiquidLevel: %s", mLiquidLevel.c_str());
             ImGui::NewLine();
             ImGui::SeparatorText("RPC interface");
@@ -404,17 +239,17 @@ public:
             }
 
             // PH calibration
-            ImGui::SliderFloat("ph", &mPH, 0.0f, 14.0f);
+            ImGui::SliderFloat("ph", &mCalibrationPH, 0.0f, 14.0f);
             ImGui::SameLine();
             if (ImGui::Button("calibrate ph-sensor")) {
                 ImGui::OpenPopup("Calibrate PH");
             }
 
             if (ImGui::BeginPopupModal("Calibrate PH")) {
-                ImGui::Text("Is your PH probe in %.2f calibration solution?", mPH);
+                ImGui::Text("Is your PH probe in %.2f calibration solution?", mCalibrationPH);
                 if (ImGui::Button("Yes")) {
                     ImGui::CloseCurrentPopup();
-                    calibratePHSensor(mPH);
+                    calibratePHSensor(mCalibrationPH);
                 }
                 ImGui::SetItemDefaultFocus();
                 ImGui::SameLine();
@@ -425,17 +260,17 @@ public:
             }
 
             // EC calibration
-            ImGui::SliderFloat("ec", &mEC, 0.0f, 3.0f);
+            ImGui::SliderFloat("ec", &mCalibrationEC, 0.0f, 3.0f);
             ImGui::SameLine();
             if (ImGui::Button("calibrate ec-sensor")) {
                 ImGui::OpenPopup("Calibrate EC");
             }
 
             if (ImGui::BeginPopupModal("Calibrate EC")) {
-                ImGui::Text("Is your EC probe in %.2f calibration solution?", mEC);
+                ImGui::Text("Is your EC probe in %.2f calibration solution?", mCalibrationEC);
                 if (ImGui::Button("Yes")) {
                     ImGui::CloseCurrentPopup();
-                    calibrateECSensor(mEC);
+                    calibrateECSensor(mCalibrationEC);
                 }
                 ImGui::SetItemDefaultFocus();
                 ImGui::SameLine();
@@ -456,7 +291,6 @@ public:
             if (mRpcError.isAcute()) {
                 ImGui::Text("Error { code: %d, message: %s }", mRpcError.code(), mRpcError.message().c_str());
             }
-
         }
         else {
             ImGui::Text("Not Connected");
@@ -472,8 +306,6 @@ public:
         handleMessages();
         onGUI(dt);
     }
-
-
 };
 
 
