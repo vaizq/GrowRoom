@@ -12,17 +12,13 @@
 
 
 
-class App {
+class Plugin {
 public:
     using Clock = std::chrono::steady_clock;
-    App();
-    virtual ~App();
-    virtual void run();
-    virtual void handleEvents(const sf::Event& event) {}
-    virtual void update(Clock::duration dt) {}
-    virtual void render() {}
-protected:
-    sf::RenderWindow mWindow;
+    virtual ~Plugin() = default;
+    virtual void handleEvents(const sf::Event& event) = 0;
+    virtual void update(Clock::duration dt) = 0;
+    virtual void render(sf::RenderWindow& window) = 0;
 };
 
 

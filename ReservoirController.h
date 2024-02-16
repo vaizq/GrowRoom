@@ -5,7 +5,7 @@
 #ifndef GROWSTUDIO_RESERVOIRCONTROLLER_H
 #define GROWSTUDIO_RESERVOIRCONTROLLER_H
 
-#include "App.h"
+#include "Plugin.h"
 #include "imgui.h"
 #include <deque>
 #include <fmt/format.h>
@@ -25,7 +25,7 @@ const std::string configFile{"ReservoirController.json"};
 static constexpr std::size_t maxDoserCount{100};
 
 
-class ReservoirController : public App
+class ReservoirController : public Plugin
 {
     using ResponseHandler = std::function<void(const nlohmann::json& response)>;
     // Gui

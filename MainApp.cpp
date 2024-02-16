@@ -1,28 +1,31 @@
 //
-// Created by vaige on 31.1.2024.
+// Created by vaige on 16.2.2024.
 //
 
-#include "App.h"
-#include "imgui.h"
+#include "MainApp.h"
 #include "imgui-SFML.h"
 #include <SFML/Window/Event.hpp>
 
-constexpr int fps = 144;
 
-App::App()
-: mWindow(sf::VideoMode(640, 480), "Application")
+static constexpr int fps{144};
+
+MainApp::MainApp()
+        : mWindow(sf::VideoMode(640, 480), "Application")
 {
     mWindow.setFramerateLimit(fps);
     if (!ImGui::SFML::Init(mWindow))
         throw std::runtime_error("Failed to initialize ImGui");
+
+    // Construct plugins
 }
 
-App::~App() {
+MainApp::~MainApp()
+{
     ImGui::SFML::Shutdown();
 }
 
-void App::run() {
-
+void MainApp::run()
+{
     sf::Clock deltaClock;
 
     while (mWindow.isOpen())
@@ -31,19 +34,25 @@ void App::run() {
         while (mWindow.pollEvent(event))
         {
             ImGui::SFML::ProcessEvent(mWindow, event);
-            handleEvents(event);
-
             if (event.type == sf::Event::Closed) {
                 mWindow.close();
+            }
+
+            for (auto& plugin : mPlugins) {
+                plugin->handleEvents(event);
             }
         }
 
         const auto dt = deltaClock.restart();
         ImGui::SFML::Update(mWindow, dt);
-        update(std::chrono::microseconds(dt.asMicroseconds()));
+        for (auto& plugin : mPlugins) {
+            plugin->update(std::chrono::microseconds(dt.asMicroseconds()));
+        }
 
         mWindow.clear();
-        render();
+        for (auto& plugin : mPlugins) {
+            plugin->render(mWindow);
+        }
         ImGui::SFML::Render(mWindow);
         mWindow.display();
     }
