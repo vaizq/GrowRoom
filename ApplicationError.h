@@ -2,21 +2,21 @@
 // Created by vaige on 14.2.2024.
 //
 
-#ifndef GROWSTUDIO_RPCERROR_H
-#define GROWSTUDIO_RPCERROR_H
+#ifndef GROWSTUDIO_APPLICATIONERROR_H
+#define GROWSTUDIO_APPLICATIONERROR_H
 
 #include <string>
 #include <nlohmann/json.hpp>
 #include <chrono>
 
 
-class RpcError
+class ApplicationError
 {
     using Clock = std::chrono::steady_clock;
 public:
-    RpcError() = default;
+    ApplicationError() = default;
 
-    RpcError(int code, std::string message, nlohmann::json data = nlohmann::json{}, Clock::duration acuteTime = std::chrono::seconds{3})
+    ApplicationError(int code, std::string message, nlohmann::json data = nlohmann::json{}, Clock::duration acuteTime = std::chrono::seconds{3})
     : mCode{code}, mMessage(std::move(message)), mData{std::move(data)}, mAcuteTime{acuteTime}
     {
         mReceiveTime = Clock::now();
@@ -46,4 +46,4 @@ private:
 };
 
 
-#endif //GROWSTUDIO_RPCERROR_H
+#endif //GROWSTUDIO_APPLICATIONERROR_H

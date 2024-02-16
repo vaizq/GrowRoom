@@ -12,7 +12,7 @@
 #include <nlohmann/json.hpp>
 #include <functional>
 #include "MqttClient.h"
-#include "RpcError.h"
+#include "ApplicationError.h"
 #include <map>
 #include "imgui_stdlib.h"
 #include <fstream>
@@ -21,6 +21,8 @@
 const std::string SERVER_ADDRESS("test.mosquitto.org:1883");
 const std::string CLIENT_ID("reservoir-controller");
 const std::string configFile{"ReservoirController.json"};
+
+static constexpr std::size_t maxDoserCount{100};
 
 
 class ReservoirController : public App
@@ -31,6 +33,7 @@ class ReservoirController : public App
     int mUseID{true};
     int mPumpID{};
     float mDoseAmount{};
+    std::array<float, maxDoserCount> mDoseAmounts{};
     float mCalibrationPH{7.0f};
     float mCalibrationEC{0.0f};
     int mDosersCount{-1};
@@ -44,7 +47,7 @@ class ReservoirController : public App
     MqttClient mClient;
     std::deque<mqtt::const_message_ptr> mMessages;
     std::map<int, ResponseHandler> mResponseHandlers;
-    RpcError mRpcError{};
+    std::deque<ApplicationError> mErrors;
 
     void openValve() {
         mClient.publish(requestTopic,
@@ -163,8 +166,7 @@ class ReservoirController : public App
         }
 
         if (response.contains("error")) {
-            std::cout << "Error!" << std::endl;
-            mRpcError = RpcError{response["error"].value("code", -1), response["error"].value("message", "No message")};
+            mErrors.emplace_back(response["error"].value("code", -1), response["error"].value("message", "No message"));
         }
     }
 
@@ -193,6 +195,10 @@ public:
             mMessages.push_back(msg);
         });
 
+        mClient.onConnected([this]() {
+            getDosersCount();
+        });
+
         mClient.connect();
 
         try {
@@ -201,6 +207,9 @@ public:
             ifs >> cfg;
             if (cfg.contains("doserNutrients")) {
                 mDoserNutrients = cfg["doserNutrients"];
+            }
+            if (cfg.contains("useID")) {
+                mUseID = cfg["useID"];
             }
         }
         catch(const std::exception& e) {
@@ -213,7 +222,8 @@ public:
         std::ofstream ofs(configFile, std::ios::out);
         try {
             nlohmann::json cfg{
-                    {"doserNutrients", mDoserNutrients}
+                    {"doserNutrients", mDoserNutrients},
+                    {"useID", mUseID}
             };
             ofs << cfg;
         }
@@ -235,17 +245,33 @@ public:
                     ImGui::EndMenu();
                 }
                 if (ImGui::BeginMenu("Configure dosers")) {
+                    ImGui::SeparatorText("Doser-nutrients");
+
+                    std::erase_if(mDoserNutrients, [](const auto& elem) {
+                        const auto& [doserID, nutrient] = elem;
+                        ImGui::Text("doserID: %d, nutrient: %s", doserID, nutrient.c_str());
+                        ImGui::SameLine();
+                        return ImGui::Button(fmt::format("Delete##{}", doserID).c_str());
+                    });
+
+                    ImGui::SeparatorText("Add doser-nutrient");
+
                     if (mDosersCount != -1) {
                         static int pumpID{};
                         static std::string nutrient;
 
                         ImGui::InputInt("pumpID", &pumpID);
                         ImGui::InputText("nutrient", &nutrient);
-                        if (ImGui::Button("store")) {
-                            mDoserNutrients[pumpID] = nutrient;
+                        if (ImGui::Button("Save")) {
+                            if (mDoserNutrients.size() < mDosersCount) {
+                                mDoserNutrients[pumpID] = nutrient;
+                            }
+                            else {
+                                mErrors.emplace_back(0, "All dosers are used. Remove existing nutrients to add create new");
+                            }
                         }
                         ImGui::SameLine();
-                        if (ImGui::Button("close")) {
+                        if (ImGui::Button("Close")) {
                             ImGui::CloseCurrentPopup();
                         }
                     }
@@ -275,10 +301,13 @@ public:
             }
 
             ImGui::Text("LiquidLevel: %s", mLiquidLevel.c_str());
-            ImGui::NewLine();
-            ImGui::SeparatorText("RPC interface");
+            ImGui::Text("Dosers count: %s", (mDosersCount == -1) ? "unknown" : std::to_string(mDosersCount).c_str());
 
-            // Valve ON/OFF
+            ImGui::NewLine();
+            ImGui::SeparatorText("Valve");
+
+            ImGui::Text("Valve is %s", mValveIsOpen ? "open" : "closed");
+            ImGui::SameLine();
             if (ImGui::Button(mValveIsOpen ? "Close valve" : "Open valve")) {
                 if (mValveIsOpen) {
                     closeValve();
@@ -289,34 +318,43 @@ public:
                 mValveIsOpen = !mValveIsOpen;
             }
 
-            // Dosing
-            ImGui::SetNextItemWidth(100);
+            ImGui::NewLine();
+            ImGui::SeparatorText("Dosing");
+
             if (mUseID) {
+                ImGui::SetNextItemWidth(100);
                 ImGui::InputInt("pumpID", &mPumpID);
                 ImGui::SameLine();
+                ImGui::SliderFloat("amount", &mDoseAmount, 0.0f, 100.0f);
+
+                if (ImGui::Button("Dose")) {
+                    dose(static_cast<unsigned>(mPumpID), mDoseAmount);
+                }
             }
             else {
                 for (const auto& [id, nutrient] : mDoserNutrients) {
-                    if (ImGui::Selectable(nutrient.c_str(), id == mPumpID)) {
-                        mPumpID = id;
+                    ImGui::SliderFloat(fmt::format("{} {}", nutrient.c_str(), id).c_str(), &mDoseAmounts[id], 0.0f, 100.0f);
+                }
+
+                if (ImGui::Button("Dose")) {
+                    for (const auto& [id, nutrient] : mDoserNutrients) {
+                        if (mDoseAmounts[id] > 0.0f) {
+                            dose(id, mDoseAmounts[id]);
+                        }
                     }
                 }
             }
-
-            ImGui::SliderFloat("amount", &mDoseAmount, 0.0f, 100.0f);
             ImGui::SameLine();
-            if (ImGui::Button("dose")) {
-                dose(static_cast<unsigned>(mPumpID), mDoseAmount);
-            }
-
-            if (ImGui::Button("reset dosers")) {
+            if (ImGui::Button("Stop")) {
                 resetDosers();
             }
 
-            // PH calibration
-            ImGui::SliderFloat("PH", &mCalibrationPH, 0.0f, 14.0f);
+            ImGui::NewLine();
+            ImGui::SeparatorText("Calibration");
+
+            ImGui::SliderFloat("Calibration PH", &mCalibrationPH, 0.0f, 14.0f);
             ImGui::SameLine();
-            if (ImGui::Button("calibrate ph-sensor")) {
+            if (ImGui::Button("Calibrate")) {
                 ImGui::OpenPopup("Calibrate PH");
             }
 
@@ -335,9 +373,9 @@ public:
             }
 
             // EC calibration
-            ImGui::SliderFloat("EC", &mCalibrationEC, 0.0f, 3.0f);
+            ImGui::SliderFloat("Calibration EC", &mCalibrationEC, 0.0f, 3.0f);
             ImGui::SameLine();
-            if (ImGui::Button("calibrate EC-sensor")) {
+            if (ImGui::Button("Calibrate")) {
                 ImGui::OpenPopup("Calibrate EC");
             }
 
@@ -355,16 +393,13 @@ public:
                 ImGui::EndPopup();
             }
 
-            // Show dosers count
-            ImGui::Text("Dosers count: %s", (mDosersCount == -1) ? "unknown" : std::to_string(mDosersCount).c_str());
-            ImGui::SameLine();
-            if (ImGui::Button("get dosers count")) {
-                getDosersCount();
-            }
-
             // Display error
-            if (mRpcError.isAcute()) {
-                ImGui::Text("Error[%d]: %s }", mRpcError.code(), mRpcError.message().c_str());
+            if (!mErrors.empty()) {
+                if (mErrors.front().isAcute()) {
+                    ImGui::Text("Error[%d]: %s ", mErrors.front().code(), mErrors.front().message().c_str());
+                } else {
+                    mErrors.pop_front();
+                }
             }
         }
         else {
