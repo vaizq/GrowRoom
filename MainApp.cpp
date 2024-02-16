@@ -17,6 +17,7 @@ MainApp::MainApp()
         throw std::runtime_error("Failed to initialize ImGui");
 
     // Construct plugins
+    mPlugins.push_back(std::make_unique<ReservoirController>());
 }
 
 MainApp::~MainApp()

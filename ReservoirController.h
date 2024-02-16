@@ -345,8 +345,11 @@ public:
                 }
             }
             ImGui::SameLine();
-            if (ImGui::Button("Stop")) {
+            if (ImGui::Button("Reset")) {
                 resetDosers();
+                for (const auto& [id, nutrient] : mDoserNutrients) {
+                    mDoseAmounts[id] = 0.0f;
+                }
             }
 
             ImGui::NewLine();
@@ -416,6 +419,9 @@ public:
         handleMessages();
         onGUI();
     }
+
+    void handleEvents(const sf::Event& e) override {}
+    void render(sf::RenderWindow& window) override {}
 };
 
 

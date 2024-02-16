@@ -1,12 +1,12 @@
 #include <iostream>
-#include "ReservoirController.h"
+#include "MainApp.h"
 
 int main()
 {
     try
     {
-        ReservoirController rc;
-        rc.run();
+        MainApp app;
+        app.run();
     }
     catch (const std::exception& e)
     {
