@@ -38,22 +38,15 @@ void MainApp::run()
             if (event.type == sf::Event::Closed) {
                 mWindow.close();
             }
-
-            for (auto& plugin : mPlugins) {
-                plugin->handleEvents(event);
-            }
         }
 
         const auto dt = deltaClock.restart();
         ImGui::SFML::Update(mWindow, dt);
         for (auto& plugin : mPlugins) {
-            plugin->update(std::chrono::microseconds(dt.asMicroseconds()));
+            plugin->onGUI();
         }
 
         mWindow.clear();
-        for (auto& plugin : mPlugins) {
-            plugin->render(mWindow);
-        }
         ImGui::SFML::Render(mWindow);
         mWindow.display();
     }

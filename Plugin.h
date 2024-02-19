@@ -14,11 +14,8 @@
 
 class Plugin {
 public:
-    using Clock = std::chrono::steady_clock;
     virtual ~Plugin() = default;
-    virtual void handleEvents(const sf::Event& event) = 0;
-    virtual void update(Clock::duration dt) = 0;
-    virtual void render(sf::RenderWindow& window) = 0;
+    virtual void onGUI() = 0;
 };
 
 

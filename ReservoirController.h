@@ -232,7 +232,7 @@ public:
         }
     }
 
-    void onGUI()
+    void onGUI() override
     {
         ImGui::Begin("ReservoirController", NULL, ImGuiWindowFlags_MenuBar);
 
@@ -413,15 +413,6 @@ public:
 
         ImGui::ShowDemoWindow();
     }
-
-    void update(Clock::duration /*dt*/) override
-    {
-        handleMessages();
-        onGUI();
-    }
-
-    void handleEvents(const sf::Event& e) override {}
-    void render(sf::RenderWindow& window) override {}
 };
 
 
